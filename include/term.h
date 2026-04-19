@@ -47,6 +47,14 @@ typedef struct Term {
   uint32_t saved_fg, saved_bg;
   uint8_t saved_attr;
   int saved_scroll_top, saved_scroll_bot;
+  bool saved_wrapnext;
+
+  /* Deferred-wrap flag (st: CURSOR_WRAPNEXT).
+   * Set when a printable char fills the last column with autowrap on.
+   * The actual newline is deferred until the next printable char arrives.
+   * This keeps cx at the last valid cell so absolute positioning stays
+   * correct (APT progress bar, vim status line, etc.). */
+  bool cursor_wrapnext;
 
   Cell *cells, *cells_alt;
   bool *dirty;

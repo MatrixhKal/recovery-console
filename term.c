@@ -75,15 +75,52 @@ static void scroll_down(Term *t, int top, int bot, int n) {
     row_clear(t, t->view_row + r, 0, t->cols - 1);
 }
 
-static void clamp_cursor(Term *t) {
-  if (t->cx < 0)
-    t->cx = 0;
-  if (t->cx >= t->cols)
-    t->cx = t->cols - 1;
-  if (t->cy < 0)
-    t->cy = 0;
-  if (t->cy >= t->rows)
-    t->cy = t->rows - 1;
+/* -------------------------------------------------------------------------
+ * Unified cursor engine -- ported from st (suckless terminal).
+ *
+ * tmoveto(t, x, y)
+ *   The ONE function all cursor positioning goes through.
+ *   - Clamps x to [0, cols-1], y to [0, rows-1]  (absolute screen coords,
+ *     not relative to scroll region -- matching st / xterm default mode)
+ *   - Clears CURSOR_WRAPNEXT so position always reflects the real cell
+ *
+ * CURSOR_WRAPNEXT (deferred-wrap / pending-wrap flag)
+ *   Set when a printable char lands on the very last column.
+ *   On the NEXT printable char we do the newline FIRST, then write.
+ *   This is how every real terminal (xterm, st, foot, kitty) works.
+ *   Without it cx appears to be cols (off-screen), breaking all absolute
+ *   positioning math (APT progress bar, vim status line, etc.)
+ *
+ * tnewline(t, first_col)
+ *   Handles LF / IND / autowrap.  Scrolls iff cy == scroll_bot.
+ * ------------------------------------------------------------------------- */
+
+/* Move cursor to (x, y) in absolute screen coords.
+ * Clears the pending-wrap flag.  This is the only way cx/cy change. */
+static void tmoveto(Term *t, int x, int y) {
+  if (x < 0)
+    x = 0;
+  if (x >= t->cols)
+    x = t->cols - 1;
+  if (y < 0)
+    y = 0;
+  if (y >= t->rows)
+    y = t->rows - 1;
+  t->cursor_wrapnext = false;
+  t->cx = x;
+  t->cy = y;
+}
+
+/* New-line: advance cy one row, scrolling if at scroll_bot.
+ * first_col: if true, also move cx to 0 (like NEL/CR+LF). */
+static void tnewline(Term *t, bool first_col) {
+  int y = t->cy;
+  if (y == t->scroll_bot) {
+    scroll_up(t, t->scroll_top, t->scroll_bot, 1);
+  } else {
+    y++;
+  }
+  tmoveto(t, first_col ? 0 : t->cx, y);
 }
 
 void term_init(Term *t, int px_w, int px_h, int cell_w, int cell_h) {
@@ -136,26 +173,27 @@ void term_free(Term *t) {
   free(t->dirty);
 }
 
+/* Write one Unicode codepoint at cursor, advance with deferred-wrap.
+ * st model:
+ *   1. If CURSOR_WRAPNEXT is pending, do the newline NOW then write.
+ *   2. Write the glyph at (cx, cy).
+ *   3. If cx+w < cols: advance cx normally via tmoveto.
+ *      Else: set CURSOR_WRAPNEXT (do NOT advance past last column).
+ */
 static void putchar_at(Term *t, uint32_t code) {
   int w = font_wcwidth(code);
-  if (t->cx + w > t->cols) {
-    if (t->mode_autowrap) {
-      /* Wrap to next line */
-      t->cx = 0;
-      t->dirty[t->cy] = true;
-      if (t->cy == t->scroll_bot)
-        scroll_up(t, t->scroll_top, t->scroll_bot, 1);
-      else
-        t->cy++;
-    } else {
-      /* Wrap disabled: clip characters at the last column */
-      t->cx = t->cols - w;
-    }
+  if (w < 1)
+    w = 1;
+
+  /* Pending wrap: materialise the newline before writing this char */
+  if (t->cursor_wrapnext) {
+    /* autowrap: go to col 0 of next row */
+    tnewline(t, true);
   }
-  if (t->cy > t->scroll_bot) {
-    scroll_up(t, t->scroll_top, t->scroll_bot, 1);
-    t->cy = t->scroll_bot;
-  }
+
+  /* Clamp write position (safety -- tmoveto / tnewline should keep us sane) */
+  if (t->cx + w > t->cols)
+    tmoveto(t, t->cols - w, t->cy);
 
   Cell *c = cell_at(t, t->view_row + t->cy, t->cx);
   c->code = code;
@@ -165,7 +203,7 @@ static void putchar_at(Term *t, uint32_t code) {
   c->width = (uint8_t)w;
   t->dirty[t->cy] = true;
 
-  /* Mark continuation cell for double-wide glyphs */
+  /* Continuation cell for double-wide glyphs */
   if (w == 2 && t->cx + 1 < t->cols) {
     Cell *c2 = cell_at(t, t->view_row + t->cy, t->cx + 1);
     c2->code = 0;
@@ -174,7 +212,16 @@ static void putchar_at(Term *t, uint32_t code) {
     c2->attr = t->attr;
     c2->width = 0;
   }
-  t->cx += w;
+
+  /* Advance cursor or arm deferred-wrap */
+  if (t->cx + w < t->cols) {
+    tmoveto(t, t->cx + w, t->cy); /* normal advance -- clears WRAPNEXT */
+  } else {
+    /* At last column: do NOT move cx past the edge.
+     * Set WRAPNEXT so the NEXT printable char triggers the newline. */
+    t->cx = t->cols - w; /* keep cx at last valid cell */
+    t->cursor_wrapnext = t->mode_autowrap;
+  }
 }
 
 static int param(Term *t, int idx, int def) {
@@ -189,36 +236,33 @@ static void csi_dispatch(Term *t, char fin) {
   int rp0 = t->nparams > 0 ? t->params[0] : 0;
 
   switch (fin) {
-  case 'A':
-    t->cy -= p0;
+  case 'A': /* CUU -- cursor up */
+    tmoveto(t, t->cx, t->cy - p0);
     break;
-  case 'B':
-    t->cy += p0;
+  case 'B': /* CUD -- cursor down */
+    tmoveto(t, t->cx, t->cy + p0);
     break;
-  case 'C':
-    t->cx += p0;
+  case 'C': /* CUF -- cursor forward */
+    tmoveto(t, t->cx + p0, t->cy);
     break;
-  case 'D':
-    t->cx -= p0;
+  case 'D': /* CUB -- cursor backward */
+    tmoveto(t, t->cx - p0, t->cy);
     break;
-  case 'E':
-    t->cy += p0;
-    t->cx = 0;
+  case 'E': /* CNL -- cursor next line */
+    tmoveto(t, 0, t->cy + p0);
     break;
-  case 'F':
-    t->cy -= p0;
-    t->cx = 0;
+  case 'F': /* CPL -- cursor prev line */
+    tmoveto(t, 0, t->cy - p0);
     break;
-  case 'G':
-    t->cx = p0 - 1;
+  case 'G': /* CHA -- cursor horizontal absolute */
+    tmoveto(t, p0 - 1, t->cy);
     break;
-  case 'H':
-  case 'f':
-    t->cy = p0 - 1;
-    t->cx = p1 - 1;
+  case 'H': /* CUP -- cursor position */
+  case 'f': /* HVP -- horizontal and vertical position */
+    tmoveto(t, p1 - 1, p0 - 1);
     break;
-  case 'd':
-    t->cy = p0 - 1;
+  case 'd': /* VPA -- vertical line position absolute */
+    tmoveto(t, t->cx, p0 - 1);
     break;
   case 'J':
     if (rp0 == 1)
@@ -264,13 +308,16 @@ static void csi_dispatch(Term *t, char fin) {
   case 'X':
     row_clear(t, t->view_row + t->cy, t->cx, t->cx + p0 - 1);
     break;
-  case 'r':
+  case 'r': /* DECSTBM -- set top and bottom margins */
     t->scroll_top = p0 - 1;
     t->scroll_bot = p1 - 1 < t->rows ? p1 - 1 : t->rows - 1;
-    t->cx = 0;
-    t->cy = 0;
+    if (t->scroll_top < 0)
+      t->scroll_top = 0;
+    if (t->scroll_bot <= t->scroll_top)
+      t->scroll_bot = t->rows - 1;
+    tmoveto(t, 0, 0); /* spec: cursor homes after DECSTBM */
     break;
-  case 's': /* save cursor */
+  case 's': /* save cursor (ANSI) */
     t->saved_cx = t->cx;
     t->saved_cy = t->cy;
     t->saved_fg = t->fg;
@@ -278,15 +325,16 @@ static void csi_dispatch(Term *t, char fin) {
     t->saved_attr = t->attr;
     t->saved_scroll_top = t->scroll_top;
     t->saved_scroll_bot = t->scroll_bot;
+    t->saved_wrapnext = t->cursor_wrapnext;
     break;
-  case 'u': /* restore cursor */
-    t->cx = t->saved_cx;
-    t->cy = t->saved_cy;
+  case 'u': /* restore cursor (ANSI) */
     t->fg = t->saved_fg;
     t->bg = t->saved_bg;
     t->attr = t->saved_attr;
     t->scroll_top = t->saved_scroll_top;
     t->scroll_bot = t->saved_scroll_bot;
+    t->cursor_wrapnext = t->saved_wrapnext;
+    tmoveto(t, t->saved_cx, t->saved_cy);
     break;
   case 'm':
     /* SGR: colors and attributes */
@@ -413,7 +461,6 @@ static void csi_dispatch(Term *t, char fin) {
   }
   }
 
-  clamp_cursor(t);
   t->dirty[old_cy] = true;
   t->dirty[t->cy] = true;
 }
@@ -452,25 +499,22 @@ void term_write(Term *t, const uint8_t *buf, int n) {
         t->state = ST_ESC;
         t->esclen = 0;
       } else if (ch == '\r') {
-        t->cx = 0;
-        t->dirty[t->cy] = true;
+        /* CR: move to column 0, keep row */
+        tmoveto(t, 0, t->cy);
       } else if (ch == '\n' || ch == 0x0b || ch == 0x0c) {
+        /* LF / VT / FF: st calls tnewline(0) -- advance row, keep col */
         t->dirty[t->cy] = true;
-        if (t->cy == t->scroll_bot)
-          scroll_up(t, t->scroll_top, t->scroll_bot, 1);
-        else
-          t->cy++;
-        t->dirty[t->cy] = true;
+        tnewline(t, false);
       } else if (ch == '\b') {
-        if (t->cx > 0) {
-          t->dirty[t->cy] = true;
-          t->cx--;
-        }
+        /* BS: move left one col */
+        tmoveto(t, t->cx - 1, t->cy);
       } else if (ch == '\t') {
+        /* HT: next tab stop */
         t->dirty[t->cy] = true;
-        t->cx = (t->cx + 8) & ~7;
-        if (t->cx >= t->cols)
-          t->cx = t->cols - 1;
+        int nx = (t->cx + 8) & ~7;
+        if (nx >= t->cols)
+          nx = t->cols - 1;
+        tmoveto(t, nx, t->cy);
       } else if (ch == 0x07 || ch == 0x0e || ch == 0x0f) {
         /* BEL, SO, SI - ignore */
       } else if (ch >= 0x20) {
@@ -495,12 +539,12 @@ void term_write(Term *t, const uint8_t *buf, int n) {
       } else if (ch == ']') {
         t->state = ST_OSC;
       } else if (ch == 'M') {
-        /* Reverse index */
+        /* RI -- Reverse Index: scroll down if at scroll_top, else move up */
         t->dirty[t->cy] = true;
         if (t->cy == t->scroll_top)
           scroll_down(t, t->scroll_top, t->scroll_bot, 1);
         else
-          t->cy--;
+          tmoveto(t, t->cx, t->cy - 1);
         t->dirty[t->cy] = true;
         t->state = ST_GROUND;
       } else if (ch == '7') {
@@ -512,27 +556,28 @@ void term_write(Term *t, const uint8_t *buf, int n) {
         t->saved_attr = t->attr;
         t->saved_scroll_top = t->scroll_top;
         t->saved_scroll_bot = t->scroll_bot;
+        t->saved_wrapnext = t->cursor_wrapnext;
         t->state = ST_GROUND;
       } else if (ch == '8') {
         /* DECRC restore cursor */
-        t->cx = t->saved_cx;
-        t->cy = t->saved_cy;
         t->fg = t->saved_fg;
         t->bg = t->saved_bg;
         t->attr = t->saved_attr;
         t->scroll_top = t->saved_scroll_top;
         t->scroll_bot = t->saved_scroll_bot;
+        t->cursor_wrapnext = t->saved_wrapnext;
+        tmoveto(t, t->saved_cx, t->saved_cy);
         t->state = ST_GROUND;
       } else if (ch == 'c') {
         /* RIS - full reset */
-        t->cx = 0;
-        t->cy = 0;
         t->fg = DEFAULT_FG;
         t->bg = DEFAULT_BG;
         t->attr = 0;
         t->scroll_top = 0;
         t->scroll_bot = t->rows - 1;
         t->charset_gfx = false;
+        t->cursor_wrapnext = false;
+        tmoveto(t, 0, 0);
         for (int r = 0; r < t->rows; r++)
           row_clear(t, t->view_row + r, 0, t->cols - 1);
         t->state = ST_GROUND;
