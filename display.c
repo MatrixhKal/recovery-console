@@ -431,14 +431,17 @@ void display_render(DisplayDev *d, Term *t) {
     any = true;
   }
 
-  /*  Cursor: solid block at current cell  */
-  if (t->cursor_visible && t->cy >= 0 && t->cy < t->rows && t->cx >= 0 &&
-      t->cx < t->cols) {
-    int x0 = t->cx * cw + MARGIN_LEFT;
-    int y0 = t->cy * ch + MARGIN_TOP;
-    uint32_t clr = palette[CURSOR_COLOR];
-    for (int y = 0; y < ch; y++)
-      hfill(x0, y0 + y, cw, clr);
+  /*  Cursor: pinned to original logical row even when scrolling  */
+  if (t->cursor_visible) {
+    int screen_cy = (t->total_rows - t->rows + t->cy) - t->view_row;
+    if (screen_cy >= 0 && screen_cy < t->rows && t->cx >= 0 &&
+        t->cx < t->cols) {
+      int x0 = t->cx * cw + MARGIN_LEFT;
+      int y0 = screen_cy * ch + MARGIN_TOP;
+      uint32_t clr = palette[CURSOR_COLOR];
+      for (int y = 0; y < ch; y++)
+        hfill(x0, y0 + y, cw, clr);
+    }
   }
 
   if (any)
