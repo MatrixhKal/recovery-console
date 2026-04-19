@@ -22,6 +22,7 @@ typedef struct {
 
 bool input_init(InputDev *in);
 void input_free(InputDev *in);
+void input_flush(InputDev *in);
 int input_read(InputDev *in, struct input_event *ev, int *out_idx);
 void input_handle_hotplug(InputDev *in);
 void input_remove_device(InputDev *in, int index);

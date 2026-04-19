@@ -3,11 +3,11 @@ OUTDIR  = output
 SRCS    = main.c display.c drm.c fbdev.c term.c input.c font.c
 NPROC  := $(shell nproc 2>/dev/null || echo 4)
 
-# Arch (set by sub-make calls below; auto-detected from CC otherwise)
+# ── Architecture detection ───────────────────────────────────────────────
 ARCH := $(shell $(CC) -dumpmachine 2>/dev/null | cut -d'-' -f1 | \
         sed 's/aarch64/aarch64/;s/x86_64/x86_64/;s/i686/x86/;s/^arm.*/armhf/')
 
-# Local FreeType: built by scripts/build-freetype.sh into deps/<arch>/
+# ── FreeType: prefer pre-built static lib, fall back to pkg-config ───────
 _FT_LOCAL := deps/$(ARCH)
 _FT_LIB   := $(_FT_LOCAL)/lib/libfreetype.a
 
@@ -19,17 +19,33 @@ else
   FT_LIBS   := $(shell pkg-config --libs   freetype2 2>/dev/null || echo "-lfreetype")
 endif
 
-CFLAGS  = -Wall -Wextra -O2 -std=gnu99 -no-pie -Iinclude -I.
+# ── Compiler flags ───────────────────────────────────────────────────────
+CFLAGS  = -Wall -Wextra -O2 -std=gnu99 -no-pie
+CFLAGS += -Iinclude -I.
 CFLAGS += -Wshadow -Wnull-dereference -Wformat=2
 CFLAGS += $(FT_CFLAGS)
+# Real-time optimisations: no function descriptor indirection, tighter code.
+CFLAGS += -fno-plt -ffunction-sections -fdata-sections
 
-# STATIC=1 links everything statically
+# ── Link flags ───────────────────────────────────────────────────────────
+# -lutil: needed by glibc for forkpty().  musl includes forkpty in libc.a
+# so we detect the C library and omit -lutil when building with musl.
+_IS_MUSL := $(shell $(CC) -dumpmachine 2>/dev/null | grep -c musl)
+
 ifeq ($(STATIC),1)
-LDFLAGS = -static -no-pie
-LIBS    = -lutil $(FT_LIBS)
+  LDFLAGS  = -static -no-pie -Wl,--gc-sections
+  ifeq ($(_IS_MUSL),0)
+    LIBS   = -lutil $(FT_LIBS)
+  else
+    LIBS   = $(FT_LIBS)        # musl: forkpty already in libc.a
+  endif
 else
-LDFLAGS = -no-pie
-LIBS    = -lutil $(FT_LIBS)
+  LDFLAGS  = -no-pie -Wl,--gc-sections
+  ifeq ($(_IS_MUSL),0)
+    LIBS   = -lutil $(FT_LIBS)
+  else
+    LIBS   = $(FT_LIBS)
+  endif
 endif
 
 OBJDIR = $(OUTDIR)/.obj/$(ARCH)
@@ -37,6 +53,7 @@ OBJS   = $(SRCS:%.c=$(OBJDIR)/%.o)
 
 Q := $(if $(V),,@)
 
+# ── Cross-compiler finder ─────────────────────────────────────────────────
 find-cc = $(shell \
     if [ -n "$(MUSL_CROSS)" ] && [ -f "$(MUSL_CROSS)/$(1)-gcc" ]; then \
         echo "$(MUSL_CROSS)/$(1)-gcc"; \
@@ -51,8 +68,9 @@ find-cc = $(shell \
 all: help
 
 help:
-	@echo "Targets: native  aarch64  armhf  x86_64  x86  clean"
-	@echo "Options: V=1 verbose | STATIC=1 full static"
+	@echo "Targets : native  aarch64  armhf  x86_64  x86  clean"
+	@echo "Options : V=1 verbose | STATIC=1 full static binary"
+	@echo "Env     : MUSL_CROSS=<dir> to point at musl toolchain"
 
 STRIP ?= strip
 
@@ -63,41 +81,44 @@ $(OUTDIR):
 	@mkdir -p $@
 
 include/font_data.h: font.ttf
-	@printf "  GEN %s\n" $@
+	@printf "  GEN  %s\n" $@
 	$(Q)xxd -i $< > $@
 
-$(OBJDIR)/%.o: %.c include/config.h include/display.h include/term.h include/font.h include/font_data.h | $(OBJDIR)
-	@printf "  CC  %s\n" $<
-	$(Q)$(CC) $(CFLAGS) -DHAVE_EMBEDDED_FONT $(if $(SYSROOT),--sysroot=$(SYSROOT)) -c $< -o $@
+$(OBJDIR)/%.o: %.c include/config.h include/display.h include/term.h \
+               include/font.h include/font_data.h | $(OBJDIR)
+	@printf "  CC   %s\n" $<
+	$(Q)$(CC) $(CFLAGS) -DHAVE_EMBEDDED_FONT \
+	    $(if $(SYSROOT),--sysroot=$(SYSROOT)) -c $< -o $@
 
 $(BINARY): $(OBJS) | $(OUTDIR)
-	@printf "  LD  %s\n" $@
+	@printf "  LD   %s\n" $@
 	$(Q)$(CC) $(OBJS) -o $(OUTDIR)/$(BINARY)-$(ARCH) $(LDFLAGS) $(LIBS)
 	$(Q)$(STRIP) $(OUTDIR)/$(BINARY)-$(ARCH) 2>/dev/null || true
 	@echo "==> $(OUTDIR)/$(BINARY)-$(ARCH) (`du -h $(OUTDIR)/$(BINARY)-$(ARCH) | cut -f1`)"
 
+# ── Convenience targets ───────────────────────────────────────────────────
 native:
 	$(MAKE) -j$(NPROC) $(BINARY)
 
 aarch64:
 	@CC="$(call find-cc,aarch64-linux-musl)" ; \
-	[ -n "$$CC" ] || { echo "aarch64-linux-musl-gcc not found"; exit 1; } ; \
+	[ -n "$$CC" ] || { echo "ERROR: aarch64-linux-musl-gcc not found"; exit 1; } ; \
 	$(MAKE) -j$(NPROC) $(BINARY) CC=$$CC STRIP=$${CC%gcc}strip STATIC=1
 
 armhf:
 	@CC="$(call find-cc,arm-linux-musleabihf)" ; \
 	[ -n "$$CC" ] || CC="$(call find-cc,armv7l-linux-musleabihf)" ; \
-	[ -n "$$CC" ] || { echo "arm-linux-musleabihf-gcc not found"; exit 1; } ; \
+	[ -n "$$CC" ] || { echo "ERROR: arm-linux-musleabihf-gcc not found"; exit 1; } ; \
 	$(MAKE) -j$(NPROC) $(BINARY) CC=$$CC STRIP=$${CC%gcc}strip STATIC=1
 
 x86_64:
 	@CC="$(call find-cc,x86_64-linux-musl)" ; \
-	[ -n "$$CC" ] || { echo "x86_64-linux-musl-gcc not found"; exit 1; } ; \
+	[ -n "$$CC" ] || { echo "ERROR: x86_64-linux-musl-gcc not found"; exit 1; } ; \
 	$(MAKE) -j$(NPROC) $(BINARY) CC=$$CC STRIP=$${CC%gcc}strip STATIC=1
 
 x86:
 	@CC="$(call find-cc,i686-linux-musl)" ; \
-	[ -n "$$CC" ] || { echo "i686-linux-musl-gcc not found"; exit 1; } ; \
+	[ -n "$$CC" ] || { echo "ERROR: i686-linux-musl-gcc not found"; exit 1; } ; \
 	$(MAKE) -j$(NPROC) $(BINARY) CC=$$CC STRIP=$${CC%gcc}strip STATIC=1
 
 clean:

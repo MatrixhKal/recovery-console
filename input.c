@@ -167,6 +167,13 @@ void input_free(InputDev *in) {
   in->inotify_fd = -1;
 }
 
+/* Drain events accumulated in the kernel ring while VT was inactive */
+void input_flush(InputDev *in) {
+  struct input_event ev;
+  for (int i = 0; i < in->count; i++)
+    while (read(in->fds[i], &ev, sizeof(ev)) > 0);
+}
+
 int input_read(InputDev *in, struct input_event *ev, int *out_idx) {
   for (int i = 0; i < in->count; i++) {
     ssize_t n = read(in->fds[i], ev, sizeof(*ev));
