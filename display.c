@@ -354,33 +354,60 @@ void display_render(DisplayDev *d, Term *t) {
       if (__builtin_expect(code >= 0x2500 && code <= 0x257F, 0)) {
         int mx = pw / 2, my = ch / 2;
         uint8_t flags = 0; /* bits: 0=left 1=right 2=up 3=down */
+        bool dbl = (code >= 0x2550 && code <= 0x256C);
+
         if (code <= 0x2501)
           flags = 3;
         else if (code <= 0x2503)
           flags = 12;
-        else {
+        else if (dbl) {
+          static const uint8_t dbl_flags[] = {
+              3,  12, 6,  6,  6,  5,  5,  5,  10, 10, 10, 9,  9,  9, 14,
+              14, 14, 13, 13, 13, 11, 11, 11, 7,  7,  7,  15, 15, 15};
+          int idx = (int)(code - 0x2550);
+          flags =
+              (idx >= 0 && idx < (int)sizeof(dbl_flags)) ? dbl_flags[idx] : 0;
+        } else {
           static const uint8_t box_flags[] = {
-              10, 10, 10, 10, 9,  9,  9,  9,
-              6,  6,  6,  6,  5,  5,  5,  5, /* 250C-251B */
-              14, 14, 14, 14, 14, 14, 14, 14,
-              13, 13, 13, 13, 13, 13, 13, 13, /* 251C-252B */
-              11, 11, 11, 11, 11, 11, 11, 11,
-              7,  7,  7,  7,  7,  7,  7,  7, /* 252C-253B */
-              15, 15, 15, 15, 15, 15, 15, 15,
-              15, 15, 15, 15, 15, 15, 15, 15, /* 253C-254B */
-          };
+              10, 10, 10, 10, 9,  9,  9,  9,  6,  6,  6,  6,  5,  5,  5,  5,
+              14, 14, 14, 14, 14, 14, 14, 14, 13, 13, 13, 13, 13, 13, 13, 13,
+              11, 11, 11, 11, 11, 11, 11, 11, 7,  7,  7,  7,  7,  7,  7,  7,
+              15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15};
           int idx = (int)(code - 0x250C);
           flags =
               (idx >= 0 && idx < (int)sizeof(box_flags)) ? box_flags[idx] : 3;
         }
-        if (flags & 1)
-          hfill(x0, y0 + my, mx + 1, fg);
-        if (flags & 2)
-          hfill(x0 + mx, y0 + my, pw - mx, fg);
-        if (flags & 4)
-          vfill(x0 + mx, y0, my + 1, fg);
-        if (flags & 8)
-          vfill(x0 + mx, y0 + my, ch - my, fg);
+
+        if (dbl) {
+          /* Double lines: draw two parallel lines offset from center */
+          int o = (ch > 16) ? 2 : 1;
+          if (flags & 1) {
+            hfill(x0, y0 + my - o, mx + 1 - o, fg);
+            hfill(x0, y0 + my + o, mx + 1 + o, fg);
+          }
+          if (flags & 2) {
+            hfill(x0 + mx + o, y0 + my - o, pw - mx - o, fg);
+            hfill(x0 + mx - o, y0 + my + o, pw - mx + o, fg);
+          }
+          if (flags & 4) {
+            vfill(x0 + mx - o, y0, my + 1 - o, fg);
+            vfill(x0 + mx + o, y0, my + 1 + o, fg);
+          }
+          if (flags & 8) {
+            vfill(x0 + mx - o, y0 + my + o, ch - my - o, fg);
+            vfill(x0 + mx + o, y0 + my - o, ch - my + o, fg);
+          }
+        } else {
+          /* Single lines */
+          if (flags & 1)
+            hfill(x0, y0 + my, mx + 1, fg);
+          if (flags & 2)
+            hfill(x0 + mx, y0 + my, pw - mx, fg);
+          if (flags & 4)
+            vfill(x0 + mx, y0, my + 1, fg);
+          if (flags & 8)
+            vfill(x0 + mx, y0 + my, ch - my, fg);
+        }
         goto cell_done;
       }
 
