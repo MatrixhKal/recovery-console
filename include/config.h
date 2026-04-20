@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define VERSION "v1.0.0"
+#define VERSION "v1.0.0-rhode"
 
 /* Cell height in pixels; width is derived from font metrics */
 #define FONT_SIZE 22
@@ -58,8 +58,8 @@
 #define SOCKET_PATH "/tmp/rc.sock"
 
 #define BACKLIGHT_PATH                                                         \
-  "/sys/devices/platform/soc/soc:mtk_leds/leds/lcd-backlight/brightness"
-#define BACKLIGHT_VAL 200
+  "/sys/class/backlight/panel0-backlight/brightness"
+#define BACKLIGHT_VAL 500
 
 #define LOG(fmt, ...)                                                          \
   do {                                                                         \
