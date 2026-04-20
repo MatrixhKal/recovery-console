@@ -3,6 +3,7 @@
 #include "display.h"
 #include <dirent.h>
 #include <drm/drm.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_mode.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -23,8 +24,14 @@ struct drm_mode_destroy_dumb {
 #define DRM_IOCTL_MODE_DESTROY_DUMB DRM_IOWR(0xB4, struct drm_mode_destroy_dumb)
 #endif
 
-/* Atomic KMS property helper: finds a property ID by name for a specific
- * object. */
+/* Fourcc for the scanout framebuffer, controlled by COLOR_BGR. */
+#if COLOR_BGR
+#define FB_FOURCC DRM_FORMAT_XBGR8888
+#else
+#define FB_FOURCC DRM_FORMAT_XRGB8888
+#endif
+
+/* Find a DRM property ID by name on an object. */
 static uint32_t get_prop_id(int fd, uint32_t obj_id, uint32_t obj_type,
                             const char *name) {
   struct drm_mode_obj_get_properties prop_res = {.obj_id = obj_id,
@@ -59,54 +66,13 @@ static uint32_t get_prop_id(int fd, uint32_t obj_id, uint32_t obj_type,
   return ret_id;
 }
 
-/* Force backlight/brightness to defined level. */
+/* Write backlight sysfs node. */
 void backlight_set(int val) {
   FILE *bf = fopen(BACKLIGHT_PATH, "w");
   if (bf) {
     fprintf(bf, "%d\n", val);
     fclose(bf);
   }
-}
-
-/* Force DPMS On: wakes panel bridge on legacy drivers. */
-static void drm_force_dpms_on(DisplayDev *d) {
-  if (d->fd < 0 || !d->buf.conn_id)
-    return;
-
-  struct drm_mode_get_connector con = {.connector_id = d->buf.conn_id};
-  if (ioctl(d->fd, DRM_IOCTL_MODE_GETCONNECTOR, &con) < 0)
-    return;
-
-  uint32_t *props = calloc(con.count_props, sizeof(uint32_t));
-  uint64_t *prop_values = calloc(con.count_props, sizeof(uint64_t));
-  if (!props || !prop_values) {
-    free(props);
-    free(prop_values);
-    return;
-  }
-
-  con.props_ptr = (uintptr_t)props;
-  con.prop_values_ptr = (uintptr_t)prop_values;
-  con.count_modes = 0;
-  if (ioctl(d->fd, DRM_IOCTL_MODE_GETCONNECTOR, &con) < 0) {
-    free(props);
-    free(prop_values);
-    return;
-  }
-
-  for (uint32_t i = 0; i < con.count_props; i++) {
-    struct drm_mode_get_property gp = {.prop_id = props[i]};
-    if (ioctl(d->fd, DRM_IOCTL_MODE_GETPROPERTY, &gp) < 0)
-      continue;
-    if (strcmp(gp.name, "DPMS") == 0) {
-      struct drm_mode_connector_set_property sp = {
-          .connector_id = d->buf.conn_id, .prop_id = props[i], .value = 0};
-      ioctl(d->fd, DRM_IOCTL_MODE_SETPROPERTY, &sp);
-      break;
-    }
-  }
-  free(props);
-  free(prop_values);
 }
 
 /* Release GEM dumb buffer + shadow. */
@@ -132,6 +98,179 @@ static void drm_buf_free(DisplayDev *d) {
   }
 }
 
+/* ---- Atomic commit helper ----
+ * Packs (obj_id, prop_id, value) triples into the flat arrays
+ * required by DRM_IOCTL_MODE_ATOMIC. Handles up to 3 objects with
+ * up to 12 properties total (plane + crtc + connector). */
+#define ATOMIC_MAX_OBJS 3
+#define ATOMIC_MAX_PROPS 12
+
+typedef struct {
+  uint32_t obj_ids[ATOMIC_MAX_OBJS];
+  uint32_t obj_prop_counts[ATOMIC_MAX_OBJS];
+  uint32_t prop_ids[ATOMIC_MAX_PROPS];
+  uint64_t prop_vals[ATOMIC_MAX_PROPS];
+  int n_objs;
+  int n_props;
+  int cur_obj; /* index into obj_ids for current object being built */
+} AtomicReq;
+
+static void atomic_begin(AtomicReq *a) {
+  memset(a, 0, sizeof(*a));
+  a->cur_obj = -1;
+}
+
+static void atomic_obj(AtomicReq *a, uint32_t obj_id) {
+  a->cur_obj = a->n_objs++;
+  a->obj_ids[a->cur_obj] = obj_id;
+  a->obj_prop_counts[a->cur_obj] = 0;
+}
+
+static void atomic_prop(AtomicReq *a, uint32_t prop_id, uint64_t val) {
+  if (!prop_id || a->cur_obj < 0)
+    return;
+  a->prop_ids[a->n_props] = prop_id;
+  a->prop_vals[a->n_props] = val;
+  a->n_props++;
+  a->obj_prop_counts[a->cur_obj]++;
+}
+
+static int atomic_commit(int fd, AtomicReq *a, uint32_t flags) {
+  struct drm_mode_atomic req = {
+      .flags = flags,
+      .count_objs = (uint32_t)a->n_objs,
+      .objs_ptr = (uintptr_t)a->obj_ids,
+      .count_props_ptr = (uintptr_t)a->obj_prop_counts,
+      .props_ptr = (uintptr_t)a->prop_ids,
+      .prop_values_ptr = (uintptr_t)a->prop_vals,
+  };
+  return ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &req);
+}
+
+/* ---- Resolve all plane geometry properties ---- */
+static void resolve_plane_props(int fd, DisplayDev *d, uint32_t plane_id) {
+  d->buf.props.plane_fb_id =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "FB_ID");
+  d->buf.props.plane_crtc_id =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+  d->buf.props.plane_src_x =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "SRC_X");
+  d->buf.props.plane_src_y =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "SRC_Y");
+  d->buf.props.plane_src_w =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "SRC_W");
+  d->buf.props.plane_src_h =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "SRC_H");
+  d->buf.props.plane_crtc_x =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_X");
+  d->buf.props.plane_crtc_y =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+  d->buf.props.plane_crtc_w =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_W");
+  d->buf.props.plane_crtc_h =
+      get_prop_id(fd, plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+}
+
+/* ---- Atomic full modeset: connector+crtc+plane in one commit ---- */
+static int atomic_modeset(DisplayDev *d) {
+  if (!d->buf.props.crtc_active || !d->buf.props.crtc_mode_id ||
+      !d->buf.primary_plane_id || !d->buf.props.plane_fb_id)
+    return -1;
+
+  /* Create mode blob */
+  if (d->mode_blob_id) {
+    struct drm_mode_destroy_blob db = {.blob_id = d->mode_blob_id};
+    ioctl(d->fd, DRM_IOCTL_MODE_DESTROYPROPBLOB, &db);
+    d->mode_blob_id = 0;
+  }
+  struct drm_mode_create_blob cb = {.data = (uintptr_t)&d->saved_mode,
+                                    .length = sizeof(struct drm_mode_modeinfo)};
+  if (ioctl(d->fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &cb) < 0)
+    return -1;
+  d->mode_blob_id = cb.blob_id;
+
+  AtomicReq a;
+  atomic_begin(&a);
+
+  /* Connector object: bind to our CRTC (required for wake-from-sleep) */
+  if (d->buf.props.conn_crtc_id) {
+    atomic_obj(&a, d->buf.conn_id);
+    atomic_prop(&a, d->buf.props.conn_crtc_id, d->buf.crtc_id);
+  }
+
+  /* CRTC object */
+  atomic_obj(&a, d->buf.crtc_id);
+  atomic_prop(&a, d->buf.props.crtc_active, 1);
+  atomic_prop(&a, d->buf.props.crtc_mode_id, d->mode_blob_id);
+
+  /* Plane object: attach FB + set source/dest rects */
+  atomic_obj(&a, d->buf.primary_plane_id);
+  atomic_prop(&a, d->buf.props.plane_fb_id, d->buf.fb_id);
+  atomic_prop(&a, d->buf.props.plane_crtc_id, d->buf.crtc_id);
+  /* Source rect is in 16.16 fixed point */
+  atomic_prop(&a, d->buf.props.plane_src_x, 0);
+  atomic_prop(&a, d->buf.props.plane_src_y, 0);
+  atomic_prop(&a, d->buf.props.plane_src_w, (uint64_t)d->width << 16);
+  atomic_prop(&a, d->buf.props.plane_src_h, (uint64_t)d->height << 16);
+  atomic_prop(&a, d->buf.props.plane_crtc_x, 0);
+  atomic_prop(&a, d->buf.props.plane_crtc_y, 0);
+  atomic_prop(&a, d->buf.props.plane_crtc_w, (uint64_t)d->width);
+  atomic_prop(&a, d->buf.props.plane_crtc_h, (uint64_t)d->height);
+
+  return atomic_commit(d->fd, &a, DRM_MODE_ATOMIC_ALLOW_MODESET);
+}
+
+/* ---- Atomic page flip: update FB_ID on the plane ---- */
+static int atomic_flip(DisplayDev *d) {
+  if (!d->buf.primary_plane_id || !d->buf.props.plane_fb_id)
+    return -1;
+
+  AtomicReq a;
+  atomic_begin(&a);
+  atomic_obj(&a, d->buf.primary_plane_id);
+  atomic_prop(&a, d->buf.props.plane_fb_id, d->buf.fb_id);
+
+  return atomic_commit(d->fd, &a, 0);
+}
+
+/* ---- Add framebuffer: ADDFB2 with fallback to legacy ADDFB ---- */
+static int add_fb(int fd, uint32_t w, uint32_t h, uint32_t pitch,
+                  uint32_t handle, uint32_t *out_fb_id) {
+  /* Try ADDFB2 with explicit fourcc first (what TWRP does) */
+  struct drm_mode_fb_cmd2 fb2 = {
+      .width = w,
+      .height = h,
+      .pixel_format = FB_FOURCC,
+      .handles = {handle},
+      .pitches = {pitch},
+      .offsets = {0},
+  };
+  if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fb2) == 0) {
+    *out_fb_id = fb2.fb_id;
+    LOG("FB created via ADDFB2 (fourcc: %c%c%c%c)", FB_FOURCC & 0xFF,
+        (FB_FOURCC >> 8) & 0xFF, (FB_FOURCC >> 16) & 0xFF,
+        (FB_FOURCC >> 24) & 0xFF);
+    return 0;
+  }
+
+  /* Fallback: legacy ADDFB (always maps to XRGB8888) */
+  struct drm_mode_fb_cmd fb = {
+      .width = w,
+      .height = h,
+      .pitch = pitch,
+      .bpp = 32,
+      .depth = 24,
+      .handle = handle,
+  };
+  if (ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fb) == 0) {
+    *out_fb_id = fb.fb_id;
+    LOG("FB created via legacy ADDFB (XRGB8888)");
+    return 0;
+  }
+
+  return -1;
+}
+
 bool drm_init_dev(DisplayDev *d) {
   d->fd = -1;
 
@@ -141,6 +280,7 @@ bool drm_init_dev(DisplayDev *d) {
   }
   LOG("DRM device opened: " DRM_DEVICE);
 
+  /* Enable universal planes + atomic caps */
   {
     struct drm_set_client_cap cp = {DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1};
     ioctl(d->fd, DRM_IOCTL_SET_CLIENT_CAP, &cp);
@@ -240,7 +380,7 @@ bool drm_init_dev(DisplayDev *d) {
   }
   d->width = (int)modes[midx].hdisplay;
   d->height = (int)modes[midx].vdisplay;
-  d->saved_mode = modes[midx]; /* save for unblank */
+  d->saved_mode = modes[midx];
 
   /* Step 4: resolve CRTC */
   if (!used_crtc) {
@@ -270,7 +410,7 @@ bool drm_init_dev(DisplayDev *d) {
   d->buf.conn_id = best_conn;
   d->buf.crtc_id = used_crtc;
 
-  /* Step 5: allocate dumb buffer (scanout) */
+  /* Step 5: allocate dumb buffer */
   struct drm_mode_create_dumb cr = {
       .width = (uint32_t)d->width,
       .height = (uint32_t)d->height,
@@ -296,23 +436,15 @@ bool drm_init_dev(DisplayDev *d) {
   }
 #endif
 
-  /* Step 6: add framebuffer */
-  struct drm_mode_fb_cmd fb = {
-      .width = (uint32_t)d->width,
-      .height = (uint32_t)d->height,
-      .pitch = d->buf.pitch,
-      .bpp = 32,
-      .depth = 24,
-      .handle = d->buf.handle,
-  };
-  if (ioctl(d->fd, DRM_IOCTL_MODE_ADDFB, &fb) < 0) {
+  /* Step 6: add framebuffer (ADDFB2 with fourcc, fallback legacy) */
+  if (add_fb(d->fd, (uint32_t)d->width, (uint32_t)d->height, d->buf.pitch,
+             d->buf.handle, &d->buf.fb_id) < 0) {
     struct drm_mode_destroy_dumb dd = {.handle = d->buf.handle};
     ioctl(d->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
     d->buf.handle = 0;
     free(modes);
     goto fail_fd;
   }
-  d->buf.fb_id = fb.fb_id;
 
   /* Step 7: mmap scanout buffer */
   struct drm_mode_map_dumb mq = {.handle = d->buf.handle};
@@ -331,29 +463,10 @@ bool drm_init_dev(DisplayDev *d) {
   }
   memset(d->buf.map, 0, d->buf.size);
 
-  /* Step 8: program CRTC */
-  ioctl(d->fd, DRM_IOCTL_SET_MASTER, 0);
-  struct drm_mode_crtc cc = {
-      .crtc_id = used_crtc,
-      .fb_id = d->buf.fb_id,
-      .set_connectors_ptr = (uintptr_t)&best_conn,
-      .count_connectors = 1,
-      .mode_valid = 1,
-      .mode = modes[midx],
-  };
-  if (ioctl(d->fd, DRM_IOCTL_MODE_SETCRTC, &cc) < 0) {
-    ioctl(d->fd, DRM_IOCTL_DROP_MASTER, 0);
-    drm_buf_free(d);
-    free(modes);
-    goto fail_fd;
-  }
-  d->buf.crtc_id = used_crtc;
-  d->buf.conn_id = best_conn;
-  d->saved_mode = modes[midx];
   LOG("display: %dx%d (CRTC:%u, Connector:%u)", d->width, d->height,
       d->buf.crtc_id, d->buf.conn_id);
 
-  /* Resolve Atomic property IDs early. */
+  /* Resolve CRTC atomic properties */
   d->buf.props.crtc_active =
       get_prop_id(d->fd, d->buf.crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
   d->buf.props.crtc_mode_id =
@@ -361,7 +474,11 @@ bool drm_init_dev(DisplayDev *d) {
   LOG("atomic: CRTC_ACTIVE:%u, CRTC_MODE_ID:%u", d->buf.props.crtc_active,
       d->buf.props.crtc_mode_id);
 
-  /* Find primary plane for the CRTC. */
+  /* Resolve connector's CRTC_ID (needed to bind connector in atomic) */
+  d->buf.props.conn_crtc_id =
+      get_prop_id(d->fd, d->buf.conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+
+  /* Find primary plane and resolve all its properties */
   struct drm_mode_get_plane_res pres = {0};
   if (ioctl(d->fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pres) == 0) {
     uint32_t *planes = calloc(pres.count_planes, sizeof(uint32_t));
@@ -372,10 +489,7 @@ bool drm_init_dev(DisplayDev *d) {
         if (ioctl(d->fd, DRM_IOCTL_MODE_GETPLANE, &p) == 0) {
           if (p.crtc_id == d->buf.crtc_id || p.crtc_id == 0) {
             d->buf.primary_plane_id = planes[i];
-            d->buf.props.plane_fb_id =
-                get_prop_id(d->fd, planes[i], DRM_MODE_OBJECT_PLANE, "FB_ID");
-            d->buf.props.plane_crtc_id =
-                get_prop_id(d->fd, planes[i], DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+            resolve_plane_props(d->fd, d, planes[i]);
             LOG("plane: %u (FB_ID:%u, CRTC_ID:%u)", d->buf.primary_plane_id,
                 d->buf.props.plane_fb_id, d->buf.props.plane_crtc_id);
             break;
@@ -386,9 +500,31 @@ bool drm_init_dev(DisplayDev *d) {
     free(planes);
   }
 
-  drm_force_dpms_on(d); /* wake panel */
-  drm_drop_master(d);   /* allow other processes to probe */
+  /* Step 8: program display - atomic first, legacy fallback */
+  ioctl(d->fd, DRM_IOCTL_SET_MASTER, 0);
 
+  if (atomic_modeset(d) == 0) {
+    LOG("modeset: atomic commit OK");
+  } else {
+    /* Legacy SETCRTC fallback */
+    struct drm_mode_crtc cc = {
+        .crtc_id = used_crtc,
+        .fb_id = d->buf.fb_id,
+        .set_connectors_ptr = (uintptr_t)&best_conn,
+        .count_connectors = 1,
+        .mode_valid = 1,
+        .mode = modes[midx],
+    };
+    if (ioctl(d->fd, DRM_IOCTL_MODE_SETCRTC, &cc) < 0) {
+      ioctl(d->fd, DRM_IOCTL_DROP_MASTER, 0);
+      drm_buf_free(d);
+      free(modes);
+      goto fail_fd;
+    }
+    LOG("modeset: legacy SETCRTC fallback");
+  }
+
+  drm_drop_master(d);
   free(modes);
   d->is_drm = true;
   return true;
@@ -409,27 +545,33 @@ void drm_free_dev(DisplayDev *d) {
   }
 }
 
-/* Re-program CRTC with saved mode + our FB. Works after both VT acquire
- * and CRTC unblank (where mode was fully destroyed). */
+/* Re-program display after VT acquire or unblank.
+ * Tries atomic, falls back to legacy SETCRTC. */
 void drm_reprogram_crtc(DisplayDev *d) {
   if (d->fd < 0 || !d->buf.fb_id || !d->buf.crtc_id)
     return;
   drm_set_master(d);
+
+  if (atomic_modeset(d) == 0) {
+    drm_drop_master(d);
+    return;
+  }
+
+  /* Legacy fallback */
   uint32_t conn = d->buf.conn_id;
   struct drm_mode_crtc cc = {
       .crtc_id = d->buf.crtc_id,
       .fb_id = d->buf.fb_id,
       .set_connectors_ptr = (uintptr_t)&conn,
       .count_connectors = 1,
-      .mode_valid = 1, /* replay full mode (critical for unblank) */
+      .mode_valid = 1,
       .mode = d->saved_mode,
   };
   ioctl(d->fd, DRM_IOCTL_MODE_SETCRTC, &cc);
-  drm_force_dpms_on(d);
   drm_drop_master(d);
 }
 
-/* Set display power state (on/off). Uses Atomic if available, else Legacy. */
+/* Set display power state (on/off). Atomic first, legacy fallback. */
 void drm_set_power(DisplayDev *d, bool on) {
   if (d->fd < 0 || !d->is_drm)
     return;
@@ -437,18 +579,11 @@ void drm_set_power(DisplayDev *d, bool on) {
   drm_set_master(d);
 
   if (d->buf.props.crtc_active) {
-    /* Atomic Path */
-    struct drm_set_client_cap cap = {DRM_CLIENT_CAP_ATOMIC, 1};
-    ioctl(d->fd, DRM_IOCTL_SET_CLIENT_CAP, &cap);
-
-    uint32_t obj_ids[2], prop_ids[2];
-    uint64_t values[2];
-    int count = 0;
-
-    obj_ids[count] = d->buf.crtc_id;
-    prop_ids[count] = d->buf.props.crtc_active;
-    values[count] = on ? 1 : 0;
-    count++;
+    /* Atomic path */
+    AtomicReq a;
+    atomic_begin(&a);
+    atomic_obj(&a, d->buf.crtc_id);
+    atomic_prop(&a, d->buf.props.crtc_active, on ? 1 : 0);
 
     if (on && d->buf.props.crtc_mode_id) {
       if (!d->mode_blob_id) {
@@ -458,24 +593,15 @@ void drm_set_power(DisplayDev *d, bool on) {
         ioctl(d->fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &cb);
         d->mode_blob_id = cb.blob_id;
       }
-      obj_ids[count] = d->buf.crtc_id;
-      prop_ids[count] = d->buf.props.crtc_mode_id;
-      values[count] = d->mode_blob_id;
-      count++;
+      atomic_prop(&a, d->buf.props.crtc_mode_id, d->mode_blob_id);
     }
 
-    struct drm_mode_atomic req = {
-        .flags = DRM_MODE_ATOMIC_ALLOW_MODESET,
-        .count_objs = 1,
-        .objs_ptr = (uintptr_t)obj_ids,
-        .count_props_ptr = (uintptr_t)(uint32_t[]){(uint32_t)count},
-        .props_ptr = (uintptr_t)prop_ids,
-        .prop_values_ptr = (uintptr_t)values,
-    };
-    ioctl(d->fd, DRM_IOCTL_MODE_ATOMIC, &req);
-  } else {
-    /* Legacy Path */
-    ioctl(d->fd, DRM_IOCTL_SET_MASTER, 0);
+    if (atomic_commit(d->fd, &a, DRM_MODE_ATOMIC_ALLOW_MODESET) == 0)
+      goto sync_bl;
+  }
+
+  /* Legacy fallback */
+  {
     struct drm_mode_crtc cc = {
         .crtc_id = d->buf.crtc_id,
         .fb_id = on ? d->buf.fb_id : 0,
@@ -485,14 +611,11 @@ void drm_set_power(DisplayDev *d, bool on) {
         .mode = d->saved_mode,
     };
     ioctl(d->fd, DRM_IOCTL_MODE_SETCRTC, &cc);
-    if (on)
-      drm_force_dpms_on(d);
-    ioctl(d->fd, DRM_IOCTL_DROP_MASTER, 0);
   }
 
+sync_bl:
   /* Physical backlight sync */
   backlight_set(on ? BACKLIGHT_VAL : 0);
-
   drm_drop_master(d);
 }
 
@@ -509,9 +632,8 @@ void drm_atomic_set_active(DisplayDev *d, bool active) {
   drm_set_power(d, active);
 }
 
-/* Flush shadow -> scanout, then tell hardware to update.
- * memcpy is a single fast burst, so tearing window is tiny vs
- * cell-by-cell rendering directly to scanout. */
+/* Flush shadow -> scanout and tell hardware to update.
+ * Tries atomic page flip, falls back to DIRTYFB. */
 void drm_kick(DisplayDev *d) {
   if (d->fd < 0 || !d->buf.map)
     return;
@@ -519,18 +641,22 @@ void drm_kick(DisplayDev *d) {
   /* Try to grab master; if busy, skip this frame (likely Xorg is active) */
   if (ioctl(d->fd, DRM_IOCTL_SET_MASTER, 0) < 0)
     return;
+
 #if USE_SHADOW_BUFFER
   if (d->shadow)
     memcpy(d->buf.map, d->shadow, d->buf.size);
 #endif
-  struct drm_mode_fb_dirty_cmd dy = {.fb_id = d->buf.fb_id};
-  ioctl(d->fd, DRM_IOCTL_MODE_DIRTYFB, &dy);
+
+  /* Atomic page flip first */
+  if (atomic_flip(d) < 0) {
+    /* Fallback: DIRTYFB */
+    struct drm_mode_fb_dirty_cmd dy = {.fb_id = d->buf.fb_id};
+    ioctl(d->fd, DRM_IOCTL_MODE_DIRTYFB, &dy);
+  }
 
   drm_drop_master(d);
 }
 
-/* CRTC-level blank: detaches connector (panel off + backlight off on LCD).
- * Unblank: full SETCRTC with saved mode (NOT mode_valid=0). */
 void drm_blank_crtc(DisplayDev *d, bool blank) { drm_set_power(d, !blank); }
 
 void drm_drop_master(DisplayDev *d) {

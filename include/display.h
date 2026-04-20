@@ -31,6 +31,7 @@ typedef struct {
     struct {
       uint32_t crtc_active;
       uint32_t crtc_mode_id;
+      uint32_t conn_crtc_id; /* connector's CRTC_ID for atomic */
       uint32_t plane_fb_id;
       uint32_t plane_crtc_id;
       uint32_t plane_src_x, plane_src_y, plane_src_w, plane_src_h;
